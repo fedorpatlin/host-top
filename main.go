@@ -11,7 +11,7 @@ import "time"
 // порог числа запросов в секунду и тикер
 var th *hostMap
 var ticker *time.Ticker
-var rps_treshold = 100
+var rpsTreshold = 100
 
 // хеш-таблица хост - счетчик запросов. Мьютекс для синхронизации доступа.
 type hostMap struct {
@@ -26,7 +26,7 @@ func (th *hostMap) Inc(host string) {
 	if _, ok := th.counters[host]; !ok {
 		th.counters[host] = 1
 	} else {
-		th.counters[host] += 1
+		th.counters[host]++
 	}
 }
 
@@ -79,7 +79,7 @@ func hostExtractor(w http.ResponseWriter, req *http.Request) {
 
 // Печатать по приходу тикера среднее количество запросов в секунду на хост
 func dumpAll() {
-	var seconds int64 = 0
+	var seconds int64
 
 	for {
 		_ = <-ticker.C
@@ -92,7 +92,7 @@ func dumpAll() {
 		tl := newTopList(th.counters)
 		for _, v := range tl {
 			rps := v.value / seconds
-			if rps < int64(rps_treshold) {
+			if rps < int64(rpsTreshold) {
 				fmt.Printf("%d/s\t|%s\n", rps, v.key)
 			} else {
 				// печатать красным
