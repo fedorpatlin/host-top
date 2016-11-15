@@ -80,15 +80,14 @@ func hostExtractor(w http.ResponseWriter, req *http.Request) {
 // Печатать по приходу тикера среднее количество запросов в секунду на хост
 func dumpAll() {
 	var seconds int64
-
+	fmt.Print("\033c")
+  fmt.Printf("RPS\t|Hostname\n")
+  fmt.Printf("-------------------------------\n")
 	for {
 		_ = <-ticker.C
 		seconds++
 		//clear console
-		fmt.Print("\033[0;2H")
-		fmt.Print("\033c")
-		fmt.Printf("RPS\t|Hostname\n")
-		fmt.Printf("-------------------------------\n")
+		fmt.Print("\033[3;0H")
 		tl := newTopList(th.counters)
 		for _, v := range tl {
 			rps := v.value / seconds
