@@ -1,17 +1,25 @@
 package main
 
-import "net/http"
+import "bytes"
+import "errors"
 import "fmt"
 import "log"
 import "sync"
 import "sort"
 import "time"
+import "os"
+import "bufio"
+import "runtime"
+import "strings"
+import "strconv"
+import "syscall"
 
 // глобальные переменные. Хеш-таблица хост-запросы,
 // порог числа запросов в секунду и тикер
 var th *hostMap
 var ticker *time.Ticker
 var rpsTreshold = 100
+var wg sync.WaitGroup
 
 // хеш-таблица хост - счетчик запросов. Мьютекс для синхронизации доступа.
 type hostMap struct {
@@ -65,24 +73,127 @@ func (tl topList) Less(i, j int) bool {
 }
 
 func main() {
-	th = new(hostMap)
 	ticker = time.NewTicker(1 * time.Second)
-	go dumpAll()
+	th = new(hostMap)
 	th.counters = make(map[string]int64)
-	http.HandleFunc("/", hostExtractor)
-	log.Fatal(http.ListenAndServe(":80", nil))
+	pl := searchNginxWorkers()
+	if len(pl) < 1 {
+		log.Fatal("Can't find nginx workers. Is nginx up and running?")
+	}
+	for _, p := range pl {
+		go attachProcess(p)
+		wg.Add(1)
+	}
+	go dumpAll()
+	wg.Wait()
 }
 
-func hostExtractor(w http.ResponseWriter, req *http.Request) {
-	th.Inc(req.Host)
+func attachProcess(pid int) {
+
+	defer wg.Done()
+	var out []byte
+	// tracer надо привязать к треду, иначе будет ошибка ESRCH в рандомных местах
+	runtime.LockOSThread()
+	if err := syscall.PtraceAttach(pid); err != nil {
+		fmt.Printf("Can't connect to pid %d, error: %s\n", pid, err.Error())
+	}
+	defer detachProcess(pid)
+//	fmt.Printf("Attached to process %d, waiting for syscall\n", pid)
+	for {
+		if regsout, err := waitForSyscall(pid, 45); err == nil {
+			syscall.PtraceGetRegs(pid, &regsout)
+			if int(regsout.Rax) > 0 {
+				out = make([]byte, regsout.Rdx)
+				syscall.PtracePeekData(pid, uintptr(regsout.Rsi), out)
+				hostExtractor(out)
+			}
+		} else {
+			log.Fatal(err.Error())
+		}
+	}
+
+}
+
+func detachProcess(pid int) {
+	if err := syscall.PtraceDetach(pid); err == nil {
+		fmt.Printf("Detached from %d\n", pid)
+	} else {
+		fmt.Println(err.Error())
+	}
+}
+
+func waitForSyscall(pid int, syscallnum int) (syscall.PtraceRegs, error) {
+	var wstatus syscall.WaitStatus
+	var rusage syscall.Rusage
+	var regsout syscall.PtraceRegs
+	syscall.PtraceSetOptions(pid, syscall.PTRACE_O_TRACESYSGOOD)
+	for {
+
+		if err := syscall.PtraceSyscall(pid, 0); err != nil {
+			return regsout, errors.New(fmt.Sprintf("Error PtraceSyscall %s", err.Error()))
+		}
+
+		if _, err := syscall.Wait4(pid, &wstatus, 0, &rusage); err == nil {
+
+			if wstatus.Stopped() {
+
+				if err := syscall.PtraceGetRegs(pid, &regsout); err != nil {
+					evt, err2 := syscall.PtraceGetEventMsg(pid)
+					if err2 != nil {
+						log.Fatal(err2.Error())
+					}
+					return regsout, errors.New(fmt.Sprintf("Error getregs: %s eventmsg %d ", err.Error(), evt))
+				}
+				if regsout.Orig_rax == uint64(syscallnum) {
+					return regsout, nil
+				}
+			}
+			if wstatus.Exited() {
+				return regsout, errors.New(fmt.Sprintf("Process %d exited unexpectedly, exit-code %d, trap cause %s", pid, wstatus.ExitStatus(), wstatus.TrapCause()))
+			}
+		}
+	}
+}
+
+func searchNginxWorkers() []int {
+	var pidlist = make([]int, 0)
+	if procdir, err := os.Open("/proc"); err == nil {
+		dirs, _ := procdir.Readdir(0)
+		for _, d := range dirs {
+			if d.IsDir() && (d.Name()[0] > '0' && d.Name()[0] < '9') {
+				f, _ := os.Open("/proc/" + d.Name() + "/cmdline")
+				reader := bufio.NewReader(f)
+				line, _ := reader.ReadString('\n')
+				if strings.HasPrefix(line, "nginx: worker process") {
+					pid, _ := strconv.ParseInt(d.Name(), 10, 0)
+					pidlist = append(pidlist, int(pid))
+				}
+			}
+		}
+	} else {
+		log.Fatal("Can't open /proc " + err.Error())
+	}
+	return pidlist
+
+}
+
+func hostExtractor(request []byte) {
+	out := bytes.Split(request, []byte{'\r', '\n'})
+	for _, h := range out {
+		if bytes.HasPrefix(h, []byte("Host:")) {
+			h := bytes.TrimSpace(bytes.Split(h, []byte{':'})[1])
+			th.Inc(string(h))
+			break
+		}
+	}
 }
 
 // Печатать по приходу тикера среднее количество запросов в секунду на хост
 func dumpAll() {
 	var seconds int64
 	fmt.Print("\033c")
-  fmt.Printf("RPS\t|Hostname\n")
-  fmt.Printf("-------------------------------\n")
+	fmt.Printf("RPS\t|Hostname\n")
+	fmt.Printf("-------------------------------\n")
 	for {
 		_ = <-ticker.C
 		seconds++
