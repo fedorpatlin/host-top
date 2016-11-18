@@ -137,11 +137,7 @@ func waitForSyscall(pid int, syscallnum int) (syscall.PtraceRegs, error) {
 			if wstatus.Stopped() {
 
 				if err := syscall.PtraceGetRegs(pid, &regsout); err != nil {
-					evt, err2 := syscall.PtraceGetEventMsg(pid)
-					if err2 != nil {
-						log.Fatal(err2.Error())
-					}
-					return regsout, fmt.Errorf("Error getregs: %s eventmsg %d ", err.Error(), evt)
+					return regsout, fmt.Errorf("Error getregs: %s", err.Error())
 				}
 				if regsout.Orig_rax == uint64(syscallnum) {
 					return regsout, nil
