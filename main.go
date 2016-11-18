@@ -1,7 +1,6 @@
 package main
 
 import "bytes"
-import "errors"
 import "fmt"
 import "log"
 import "sync"
@@ -98,7 +97,7 @@ func attachProcess(pid int) {
 		fmt.Printf("Can't connect to pid %d, error: %s\n", pid, err.Error())
 	}
 	defer detachProcess(pid)
-//	fmt.Printf("Attached to process %d, waiting for syscall\n", pid)
+	//	fmt.Printf("Attached to process %d, waiting for syscall\n", pid)
 	for {
 		if regsout, err := waitForSyscall(pid, 45); err == nil {
 			syscall.PtraceGetRegs(pid, &regsout)
@@ -130,7 +129,7 @@ func waitForSyscall(pid int, syscallnum int) (syscall.PtraceRegs, error) {
 	for {
 
 		if err := syscall.PtraceSyscall(pid, 0); err != nil {
-			return regsout, errors.New(fmt.Sprintf("Error PtraceSyscall %s", err.Error()))
+			return regsout, fmt.Errorf("Error PtraceSyscall %s", err.Error())
 		}
 
 		if _, err := syscall.Wait4(pid, &wstatus, 0, &rusage); err == nil {
@@ -142,14 +141,14 @@ func waitForSyscall(pid int, syscallnum int) (syscall.PtraceRegs, error) {
 					if err2 != nil {
 						log.Fatal(err2.Error())
 					}
-					return regsout, errors.New(fmt.Sprintf("Error getregs: %s eventmsg %d ", err.Error(), evt))
+					return regsout, fmt.Errorf("Error getregs: %s eventmsg %d ", err.Error(), evt)
 				}
 				if regsout.Orig_rax == uint64(syscallnum) {
 					return regsout, nil
 				}
 			}
 			if wstatus.Exited() {
-				return regsout, errors.New(fmt.Sprintf("Process %d exited unexpectedly, exit-code %d, trap cause %s", pid, wstatus.ExitStatus(), wstatus.TrapCause()))
+				return regsout, fmt.Errorf("Process %d exited unexpectedly, exit-code %d, trap cause %s", pid, wstatus.ExitStatus(), wstatus.TrapCause())
 			}
 		}
 	}
