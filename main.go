@@ -13,6 +13,10 @@ import "strings"
 import "strconv"
 import "syscall"
 
+func init() {
+	runtime.LockOSThread()
+}
+
 // глобальные переменные. Хеш-таблица хост-запросы,
 // порог числа запросов в секунду и тикер
 var th *hostMap
@@ -23,7 +27,7 @@ var wg sync.WaitGroup
 // хеш-таблица хост - счетчик запросов. Мьютекс для синхронизации доступа.
 type hostMap struct {
 	counters map[string]int64
-	lock     sync.Mutex
+	lock     sync.RWMutex
 }
 
 // увеличение на 1 счетчика запросов к хосту
@@ -37,6 +41,18 @@ func (th *hostMap) Inc(host string) {
 	}
 }
 
+func (th *hostMap) ToList() topList {
+	var lst = make(topList, len(th.counters))
+	var i int
+	th.lock.RLock()
+	defer th.lock.RUnlock()
+	for k, v := range th.counters {
+		lst[i] = hostRecord{k, v}
+		i++
+	}
+	return lst
+}
+
 type hostRecord struct {
 	key   string
 	value int64
@@ -46,15 +62,10 @@ type topList []hostRecord
 
 // Представление хеш-таблицы счетчиков хостов в виде списка,
 // сортированного по количеству запросов
-func newTopList(hm map[string]int64) topList {
-	var tl = make(topList, len(hm))
-	i := 0
-	for k, v := range hm {
-		tl[i] = hostRecord{k, v}
-		i++
-	}
-	sort.Sort(sort.Reverse(tl))
-	return tl
+func newTopList(th *hostMap) topList {
+	lst := th.ToList()
+	sort.Sort(sort.Reverse(lst))
+	return lst
 }
 
 // Реализация интерфейса sort
@@ -72,6 +83,7 @@ func (tl topList) Less(i, j int) bool {
 }
 
 func main() {
+	runtime.LockOSThread()
 	ticker = time.NewTicker(1 * time.Second)
 	th = new(hostMap)
 	th.counters = make(map[string]int64)
@@ -80,37 +92,20 @@ func main() {
 		log.Fatal("Can't find nginx workers. Is nginx up and running?")
 	}
 	for _, p := range pl {
-		go attachProcess(p)
+		go syscallSpy(p, 45)
 		wg.Add(1)
 	}
 	go dumpAll()
 	wg.Wait()
 }
 
-func attachProcess(pid int) {
+func attachProcess(pid int) error {
 
-	defer wg.Done()
-	var out []byte
-	// tracer надо привязать к треду, иначе будет ошибка ESRCH в рандомных местах
-	runtime.LockOSThread()
 	if err := syscall.PtraceAttach(pid); err != nil {
-		fmt.Printf("Can't connect to pid %d, error: %s\n", pid, err.Error())
+		return fmt.Errorf("Can't attach to pid %d, error: %s\n", pid, err.Error())
 	}
-	defer detachProcess(pid)
 	//	fmt.Printf("Attached to process %d, waiting for syscall\n", pid)
-	for {
-		if regsout, err := waitForSyscall(pid, 45); err == nil {
-			syscall.PtraceGetRegs(pid, &regsout)
-			if int(regsout.Rax) > 0 {
-				out = make([]byte, regsout.Rdx)
-				syscall.PtracePeekData(pid, uintptr(regsout.Rsi), out)
-				hostExtractor(out)
-			}
-		} else {
-			log.Fatal(err.Error())
-		}
-	}
-
+	return nil
 }
 
 func detachProcess(pid int) {
@@ -118,6 +113,32 @@ func detachProcess(pid int) {
 		fmt.Printf("Detached from %d\n", pid)
 	} else {
 		fmt.Println(err.Error())
+	}
+}
+
+func syscallSpy(pid int, syscallNr int) {
+	// tracer надо привязать к треду, иначе будет ошибка ESRCH в рандомных местах
+	runtime.LockOSThread()
+	defer wg.Done()
+	var out []byte
+	if err := attachProcess(pid); err != nil {
+		fmt.Println(err.Error())
+	} else {
+		defer detachProcess(pid)
+		for {
+			if regsout, err := waitForSyscall(pid, syscallNr); err == nil {
+				//			syscall.PtraceGetRegs(pid, &regsout)
+				if int(regsout.Rax) > 0 {
+					out = make([]byte, regsout.Rdx)
+					syscall.PtracePeekData(pid, uintptr(regsout.Rsi), out)
+					if h, err := hostExtractor(out); err == nil {
+						th.Inc(string(h))
+					}
+				}
+			} else {
+				fmt.Errorf(err.Error())
+			}
+		}
 	}
 }
 
@@ -129,12 +150,12 @@ func waitForSyscall(pid int, syscallnum int) (syscall.PtraceRegs, error) {
 	for {
 
 		if err := syscall.PtraceSyscall(pid, 0); err != nil {
-			return regsout, fmt.Errorf("Error PtraceSyscall %s", err.Error())
+			return regsout, fmt.Errorf("Error PtraceSyscall %s, %d", err.Error())
 		}
 
 		if _, err := syscall.Wait4(pid, &wstatus, 0, &rusage); err == nil {
 
-			if wstatus.Stopped() {
+			if wstatus.Stopped() && wstatus.Signal()&0x80 == 0x80 {
 
 				if err := syscall.PtraceGetRegs(pid, &regsout); err != nil {
 					return regsout, fmt.Errorf("Error getregs: %s", err.Error())
@@ -172,14 +193,36 @@ func searchNginxWorkers() []int {
 
 }
 
-func hostExtractor(request []byte) {
+func hostExtractor(request []byte) (string, error) {
+	//	fmt.Println(string(request))
 	out := bytes.Split(request, []byte{'\r', '\n'})
-	for _, h := range out {
-		if bytes.HasPrefix(h, []byte("Host:")) {
-			h := bytes.TrimSpace(bytes.Split(h, []byte{':'})[1])
-			th.Inc(string(h))
-			break
+	if isRequest(out[0]) {
+		for _, h := range out {
+			h := bytes.TrimSpace(h)
+			if bytes.HasPrefix(h, []byte("Host:")) {
+				h := bytes.TrimSpace(bytes.Split(h, []byte{':'})[1])
+				return string(h), nil
+			}
 		}
+		return "", fmt.Errorf("No Host header\n")
+	}
+	return "", fmt.Errorf("WTF is this?")
+}
+
+func isRequest(firstString []byte) bool {
+	fstr := bytes.TrimSpace(firstString)
+	words := bytes.Split(fstr, []byte(" "))
+	if len(words) > 2 {
+		// в words[0] должен лежать HTTP-метод, но их дохуя и они могут быть добавлены
+		// плагинами, разбирать uri тоже желания нет, поэтому, смотрим words[2].
+		// words[2] должен содержать версию протокола (HTTP/1.1)
+		if bytes.HasPrefix(words[2], []byte("HTTP")) {
+			return true
+		} else {
+			return false
+		}
+	} else {
+		return false
 	}
 }
 
@@ -194,7 +237,7 @@ func dumpAll() {
 		seconds++
 		//clear console
 		fmt.Print("\033[3;0H")
-		tl := newTopList(th.counters)
+		tl := newTopList(th)
 		for _, v := range tl {
 			rps := v.value / seconds
 			if rps < int64(rpsTreshold) {
